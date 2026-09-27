@@ -1,128 +1,277 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import OrderForm, { type OrderDraft } from "./components/OrderForm";
+import PendingBoard from "./components/PendingBoard";
+import MachineBoard from "./components/MachineBoard";
+import FinishDialog from "./components/FinishDialog";
+import CustomerHistory from "./components/CustomerHistory";
+import { loadState, resetState, saveState } from "./storage";
+import {
+  BOARD_TYPES,
+  checkDispatch,
+  consumeWheel,
+  evaluateFinish,
+  type AngleActuals,
+  type Order,
+  type ShopState,
+} from "./rules";
 
-const project = {
-  "sourceNo": 6,
-  "id": "hxyfront-62004",
-  "port": 62004,
-  "title": "滑雪板调校维护",
-  "domain": "滑雪装备调校",
-  "prompt": "我想做一个面向滑雪板调校店的装备维护前端系统，技师可以记录雪板品牌、长度、板型、刃角、打蜡类型、底板损伤、修补位置和客户偏好。页面需要有维护工单列表、刃角参数表、底板损伤标记区、完工状态筛选和客户历史维护记录。",
-  "palette": [
-    "#0369a1",
-    "#14b8a6",
-    "#f97316"
-  ],
-  "metrics": [
-    "待维护",
-    "完工工单",
-    "平均刃角",
-    "底板修补"
-  ],
-  "filters": [
-    "全地域",
-    "公园板",
-    "竞速板",
-    "粉雪板"
-  ],
-  "fields": [
-    "雪板品牌",
-    "长度",
-    "板型",
-    "刃角",
-    "打蜡类型",
-    "底板损伤"
-  ],
-  "records": [
-    [
-      "ORD-106",
-      "Burton 156",
-      "侧刃88°，底刃1°",
-      "已打低温蜡"
-    ],
-    [
-      "ORD-112",
-      "竞速板165",
-      "底板划痕12cm",
-      "待补P-Tex"
-    ],
-    [
-      "ORD-118",
-      "粉雪板158",
-      "客户偏好弱咬雪",
-      "待交付"
-    ]
-  ]
-};
+export default function App() {
+  const [state, setState] = useState<ShopState>(() => loadState());
+  const [finishOrderId, setFinishOrderId] = useState<string | null>(null);
 
-function App() {
+  // 任何变更都写回浏览器
+  useEffect(() => {
+    saveState(state);
+  }, [state]);
+
+  const createOrder = (draft: OrderDraft) => {
+    setState((s) => {
+      const id = `WO-${s.orderSeq}`;
+      const order: Order = {
+        id,
+        customer: draft.customer,
+        board: draft.board,
+        boardType: draft.boardType,
+        length: draft.length,
+        targets: {
+          leftSide: draft.leftSide,
+          rightSide: draft.rightSide,
+          base: draft.base,
+        },
+        status: "pending",
+        machineId: null,
+        slot: null,
+        conflicts: [],
+        actuals: null,
+        deviations: null,
+        createdAt: Date.now(),
+        scheduledAt: null,
+        finishedAt: null,
+      };
+      return { ...s, orderSeq: s.orderSeq + 1, orders: [order, ...s.orders] };
+    });
+  };
+
+  const dispatchOrder = (orderId: string, machineId: string, slot: number) => {
+    setState((s) => {
+      const order = s.orders.find((o) => o.id === orderId);
+      const machine = s.machines.find((m) => m.id === machineId);
+      if (!order || !machine) return s;
+
+      // 规则层裁定：冲突则留在待排并写明原因
+      const result = checkDispatch(machine, order, s.orders, slot);
+      if (!result.ok) {
+        return {
+          ...s,
+          orders: s.orders.map((o) =>
+            o.id === orderId ? { ...o, conflicts: result.conflicts } : o
+          ),
+        };
+      }
+
+      return {
+        ...s,
+        machines: s.machines.map((m) =>
+          m.id === machineId ? consumeWheel(m, order.length) : m
+        ),
+        orders: s.orders.map((o) =>
+          o.id === orderId
+            ? {
+                ...o,
+                status: "scheduled",
+                machineId,
+                slot,
+                conflicts: [],
+                scheduledAt: Date.now(),
+              }
+            : o
+        ),
+      };
+    });
+  };
+
+  const finishOrder = (orderId: string, actuals: AngleActuals) => {
+    setState((s) => {
+      const order = s.orders.find((o) => o.id === orderId);
+      if (!order || !order.machineId || order.slot === null) return s;
+      const machine = s.machines.find((m) => m.id === order.machineId);
+
+      const result = evaluateFinish(order.targets, actuals);
+      const at = Date.now();
+
+      // 每次登记都进入客户历史（含机器、槽位与实测角度）
+      const history =
+        machine
+          ? [
+              {
+                customer: order.customer,
+                orderId: order.id,
+                board: order.board,
+                boardType: order.boardType,
+                machineId: machine.id,
+                machineName: machine.name,
+                slot: order.slot,
+                targets: order.targets,
+                actuals: result.actuals,
+                passed: result.passed,
+                at,
+              },
+              ...s.history,
+            ]
+          : s.history;
+
+      // 超差退回：状态置为 returned，原槽不释放
+      if (!result.passed) {
+        return {
+          ...s,
+          history,
+          orders: s.orders.map((o) =>
+            o.id === orderId
+              ? {
+                  ...o,
+                  status: "returned",
+                  actuals: result.actuals,
+                  deviations: result.deviations,
+                  conflicts: result.failures,
+                }
+              : o
+          ),
+        };
+      }
+
+      // 合格：完工并释放槽位
+      return {
+        ...s,
+        history,
+        orders: s.orders.map((o) =>
+          o.id === orderId
+            ? {
+                ...o,
+                status: "done",
+                machineId: null,
+                slot: null,
+                conflicts: [],
+                actuals: result.actuals,
+                deviations: result.deviations,
+                finishedAt: at,
+              }
+            : o
+        ),
+      };
+    });
+    setFinishOrderId(null);
+  };
+
+  const replaceWheel = (machineId: string) => {
+    setState((s) => ({
+      ...s,
+      machines: s.machines.map((m) =>
+        m.id === machineId ? { ...m, wheelRemaining: m.wheelCapacity } : m
+      ),
+    }));
+  };
+
+  const clearLocal = () => {
+    if (window.confirm("确定清空浏览器数据并恢复演示数据？")) {
+      setState(resetState());
+    }
+  };
+
+  const activeOrder = state.orders.find((o) => o.id === finishOrderId) ?? null;
+  const finishMachine = activeOrder?.machineId
+    ? state.machines.find((m) => m.id === activeOrder.machineId)
+    : undefined;
+
+  const metrics = useMemo(() => {
+    const pending = state.orders.filter((o) => o.status === "pending").length;
+    const working = state.orders.filter(
+      (o) => o.status === "scheduled" || o.status === "returned"
+    ).length;
+    const done = state.orders.filter((o) => o.status === "done").length;
+    const returned = state.orders.filter((o) => o.status === "returned").length;
+    return { pending, working, done, returned };
+  }, [state.orders]);
+
+  const boardSummary = useMemo(() => {
+    const map = new Map<string, number>();
+    state.orders
+      .filter((o) => o.status === "pending")
+      .forEach((o) => map.set(o.boardType, (map.get(o.boardType) ?? 0) + 1));
+    return map;
+  }, [state.orders]);
+
   return (
     <main className="app">
-      <section className="hero">
-        <p>{project.id} · 源提示词{project.sourceNo} · Port {project.port}</p>
-        <h1>{project.title}</h1>
-        <span>{project.prompt}</span>
+      <section className="hero compact">
+        <div>
+          <p>Edge Sharpener Desk · 磨刃排程台</p>
+          <h1>磨刃排程台</h1>
+          <span>
+            工单登记板型、左右侧刃与底刃目标；派工按板长扣减砂轮寿命，机型不合、余量不足或槽位占用即留单写明冲突；
+            完工登记实测刃角，偏差超过 0.3° 退回且原槽不释放。
+          </span>
+        </div>
+        <button className="ghost-btn" onClick={clearLocal}>
+          重置本地数据
+        </button>
       </section>
 
       <section className="metrics">
-        {project.metrics.map((metric: string, index: number) => (
-          <article key={metric}>
-            <small>{metric}</small>
-            <strong>{[86, 14, 7, 32][index] ?? 12}</strong>
-          </article>
-        ))}
+        <article>
+          <small>待排工单</small>
+          <strong>{metrics.pending}</strong>
+        </article>
+        <article>
+          <small>槽位在制（含退回）</small>
+          <strong>{metrics.working}</strong>
+        </article>
+        <article>
+          <small>合格完工</small>
+          <strong>{metrics.done}</strong>
+        </article>
+        <article className={metrics.returned > 0 ? "alarm" : ""}>
+          <small>超差退回</small>
+          <strong>{metrics.returned}</strong>
+        </article>
       </section>
 
       <section className="workspace">
-        <aside className="panel">
-          <h2>{project.domain}筛选</h2>
-          <div className="chips">
-            {project.filters.map((item: string) => (
-              <button key={item}>{item}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel form-panel">
-          <div className="heading">
-            <div>
-              <p>专业字段</p>
-              <h2>新增记录</h2>
-            </div>
-            <button className="primary">保存草稿</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
-
-      <section className="panel">
-        <div className="heading">
-          <div>
-            <p>历史记录</p>
-            <h2>近期工作台</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="records">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")}>
-              <b>{String(index + 1).padStart(2, "0")}</b>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
+        <div className="stack">
+          <OrderForm onCreate={createOrder} />
+          {boardSummary.size > 0 && (
+            <section className="panel chips-panel">
+              <span className="hint">待排板型分布：</span>
+              <div className="chips">
+                {[...boardSummary.entries()].map(([t, n]) => (
+                  <button key={t} className="static-chip">
+                    {BOARD_TYPES[t as keyof typeof BOARD_TYPES]} × {n}
+                  </button>
+                ))}
               </div>
-            </article>
-          ))}
+            </section>
+          )}
         </div>
+        <PendingBoard orders={state.orders} machines={state.machines} onDispatch={dispatchOrder} />
       </section>
+
+      <MachineBoard
+        machines={state.machines}
+        orders={state.orders}
+        onOpenFinish={setFinishOrderId}
+        onReplaceWheel={replaceWheel}
+      />
+
+      <CustomerHistory history={state.history} />
+
+      {activeOrder && (
+        <FinishDialog
+          order={activeOrder}
+          machine={finishMachine}
+          onClose={() => setFinishOrderId(null)}
+          onSubmit={(orderId, actuals) => finishOrder(orderId, actuals)}
+        />
+      )}
     </main>
   );
 }
-
-export default App;
