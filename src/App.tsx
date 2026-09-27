@@ -1,126 +1,163 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import {
+  BOARD_TYPES,
+  dispatchConflicts,
+  overToleranceText,
+  passesTolerance,
+  round2,
+  wheelConsumptionM,
+} from "./domain/rules";
+import type { AppState, BoardType, EdgeAngles, HistoryEntry, OrderDraft, WorkOrder } from "./domain/types";
+import { loadState, resetState, saveState } from "./storage/store";
+import { ActiveList } from "./ui/ActiveList";
+import { HistoryPanel } from "./ui/HistoryPanel";
+import { MachineBoard } from "./ui/MachineBoard";
+import { MetricsBar } from "./ui/MetricsBar";
+import { OrderForm } from "./ui/OrderForm";
+import { PendingQueue } from "./ui/PendingQueue";
 
-const project = {
-  "sourceNo": 6,
-  "id": "hxyfront-62004",
-  "port": 62004,
-  "title": "滑雪板调校维护",
-  "domain": "滑雪装备调校",
-  "prompt": "我想做一个面向滑雪板调校店的装备维护前端系统，技师可以记录雪板品牌、长度、板型、刃角、打蜡类型、底板损伤、修补位置和客户偏好。页面需要有维护工单列表、刃角参数表、底板损伤标记区、完工状态筛选和客户历史维护记录。",
-  "palette": [
-    "#0369a1",
-    "#14b8a6",
-    "#f97316"
-  ],
-  "metrics": [
-    "待维护",
-    "完工工单",
-    "平均刃角",
-    "底板修补"
-  ],
-  "filters": [
-    "全地域",
-    "公园板",
-    "竞速板",
-    "粉雪板"
-  ],
-  "fields": [
-    "雪板品牌",
-    "长度",
-    "板型",
-    "刃角",
-    "打蜡类型",
-    "底板损伤"
-  ],
-  "records": [
-    [
-      "ORD-106",
-      "Burton 156",
-      "侧刃88°，底刃1°",
-      "已打低温蜡"
-    ],
-    [
-      "ORD-112",
-      "竞速板165",
-      "底板划痕12cm",
-      "待补P-Tex"
-    ],
-    [
-      "ORD-118",
-      "粉雪板158",
-      "客户偏好弱咬雪",
-      "待交付"
-    ]
-  ]
-};
+type TypeFilter = "全部" | BoardType;
 
 function App() {
+  const [state, setState] = useState<AppState>(loadState);
+  const [filter, setFilter] = useState<TypeFilter>("全部");
+
+  // 状态变更即写入浏览器存储
+  useEffect(() => {
+    saveState(state);
+  }, [state]);
+
+  const matches = (o: WorkOrder) => filter === "全部" || o.boardType === filter;
+  const pending = useMemo(() => state.orders.filter((o) => o.status === "pending" && matches(o)), [state.orders, filter]);
+  const inProgress = useMemo(
+    () => state.orders.filter((o) => (o.status === "active" || o.status === "rework") && matches(o)),
+    [state.orders, filter]
+  );
+
+  /** 登记工单：进入待排队列 */
+  const registerOrder = (draft: OrderDraft) => {
+    setState((s) => {
+      const order: WorkOrder = {
+        id: `MO-${s.seq}`,
+        customer: draft.customer,
+        brand: draft.brand,
+        boardType: draft.boardType,
+        boardLengthCm: draft.boardLengthCm,
+        target: draft.target,
+        status: "pending",
+        conflict: null,
+        assignment: null,
+        measured: null,
+        rejectNote: null,
+        createdAt: Date.now(),
+        completedAt: null,
+      };
+      return { ...s, seq: s.seq + 1, orders: [order, ...s.orders] };
+    });
+  };
+
+  /** 派工：机型不合 / 余量不足 / 槽位占用则留在待排并写明冲突，否则占槽并按板长扣砂轮寿命 */
+  const dispatchOrder = (orderId: string, machineId: string, slotId: string) => {
+    setState((s) => {
+      const order = s.orders.find((o) => o.id === orderId);
+      const machine = s.machines.find((m) => m.id === machineId);
+      if (!order || !machine) return s;
+      const slotLabel = machine.slots.find((sl) => sl.id === slotId)?.label ?? slotId;
+      const conflicts = dispatchConflicts(order, machine, slotId, s.orders);
+      if (conflicts.length > 0) {
+        const conflict = `上次派工 ${machineId}·${slotLabel}：${conflicts.join("、")}`;
+        return { ...s, orders: s.orders.map((o) => (o.id === orderId ? { ...o, conflict } : o)) };
+      }
+      const consumption = wheelConsumptionM(order);
+      return {
+        ...s,
+        machines: s.machines.map((m) =>
+          m.id === machineId ? { ...m, wheelUsedM: round2(m.wheelUsedM + consumption) } : m
+        ),
+        orders: s.orders.map((o) =>
+          o.id === orderId
+            ? { ...o, status: "active" as const, assignment: { machineId, slotId }, conflict: null, rejectNote: null }
+            : o
+        ),
+      };
+    });
+  };
+
+  /** 完工登记：偏差超 0.3° 退回且原槽不释放；合格则完工放槽，两侧都写入客户历史 */
+  const completeOrder = (orderId: string, measured: EdgeAngles) => {
+    setState((s) => {
+      const order = s.orders.find((o) => o.id === orderId);
+      if (!order || !order.assignment) return s;
+      const machine = s.machines.find((m) => m.id === order.assignment!.machineId);
+      const slotLabel =
+        machine?.slots.find((sl) => sl.id === order.assignment!.slotId)?.label ?? order.assignment.slotId;
+      const pass = passesTolerance(order.target, measured);
+      const entry: HistoryEntry = {
+        id: `H-${orderId}-${Date.now()}`,
+        orderId: order.id,
+        customer: order.customer,
+        boardLabel: `${order.brand || "未填品牌"} · ${order.boardType} ${order.boardLengthCm}cm`,
+        machineId: machine?.id ?? "",
+        machineName: machine?.name ?? "未知机器",
+        slotLabel,
+        measured,
+        result: pass ? "pass" : "reject",
+        at: Date.now(),
+      };
+      const orders = s.orders.map((o) => {
+        if (o.id !== orderId) return o;
+        if (pass) {
+          return { ...o, status: "done" as const, measured, rejectNote: null, completedAt: Date.now() };
+        }
+        const note = `超差：${overToleranceText(order.target, measured)}（容差 ±0.3°），原槽保留返工`;
+        return { ...o, status: "rework" as const, measured, rejectNote: note };
+      });
+      return { ...s, orders, history: [entry, ...s.history] };
+    });
+  };
+
+  const resetAll = () => {
+    if (window.confirm("清空浏览器中的排程数据并恢复演示数据？")) {
+      setState(resetState());
+    }
+  };
+
   return (
     <main className="app">
       <section className="hero">
-        <p>{project.id} · 源提示词{project.sourceNo} · Port {project.port}</p>
-        <h1>{project.title}</h1>
-        <span>{project.prompt}</span>
+        <p>磨刃排程台 · 滑雪板调校维护</p>
+        <h1>磨刃排程台</h1>
+        <span>
+          工单登记板型与左右侧刃、底刃目标角度；派工选机器与槽位，按板长扣减砂轮寿命，机型不合、余量不足或槽位占用即留待排并写明冲突；完工登记实测刃角，偏差超
+          0.3° 退回且原槽不释放；客户历史保留机器、槽位与实测角度，数据保存在浏览器。
+        </span>
+        <div className="hero-actions">
+          <button onClick={resetAll}>重置演示数据</button>
+        </div>
       </section>
 
-      <section className="metrics">
-        {project.metrics.map((metric: string, index: number) => (
-          <article key={metric}>
-            <small>{metric}</small>
-            <strong>{[86, 14, 7, 32][index] ?? 12}</strong>
-          </article>
+      <MetricsBar orders={state.orders} />
+
+      <div className="filter-bar">
+        {(["全部", ...BOARD_TYPES] as TypeFilter[]).map((t) => (
+          <button key={t} className={filter === t ? "chip chip-on" : "chip"} onClick={() => setFilter(t)}>
+            {t}
+          </button>
         ))}
-      </section>
+      </div>
 
       <section className="workspace">
-        <aside className="panel">
-          <h2>{project.domain}筛选</h2>
-          <div className="chips">
-            {project.filters.map((item: string) => (
-              <button key={item}>{item}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel form-panel">
-          <div className="heading">
-            <div>
-              <p>专业字段</p>
-              <h2>新增记录</h2>
-            </div>
-            <button className="primary">保存草稿</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
+        <MachineBoard machines={state.machines} orders={state.orders} />
+        <OrderForm onRegister={registerOrder} />
       </section>
 
-      <section className="panel">
-        <div className="heading">
-          <div>
-            <p>历史记录</p>
-            <h2>近期工作台</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="records">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")}>
-              <b>{String(index + 1).padStart(2, "0")}</b>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
+      <section className="queues">
+        <PendingQueue orders={pending} machines={state.machines} allOrders={state.orders} onDispatch={dispatchOrder} />
+        <ActiveList orders={inProgress} machines={state.machines} onComplete={completeOrder} />
       </section>
+
+      <HistoryPanel history={state.history} />
     </main>
   );
 }
